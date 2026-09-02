@@ -34,8 +34,9 @@
 //! for MinGW this has to be done manually.
 //!
 //! The following paths are the hardcoded defaults:
-//! MSVC the last registry key at
-//! `HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots`, for MinGW we try our luck by simply
+//! MSVC the newest SDK found under
+//! `HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots` (`%RC_PATH%` and a Developer Command
+//! Prompt's `%WindowsSdkVerBinPath%` take precedence), for MinGW we try our luck by simply
 //! using the `%PATH%` environment variable.
 //!
 //! Note that the toolkit bitness as to match the one from the current Rust compiler. If you are
@@ -45,8 +46,10 @@
 //! [`WindowsResource::compile()`]: struct.WindowsResource.html#method.compile
 //! [`WindowsResource::new()`]: struct.WindowsResource.html#method.new
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::io::prelude::*;
@@ -228,10 +231,7 @@ impl WindowsResource {
         ver.insert(VersionInfo::FILEFLAGS, 0);
 
         let sdk = if cfg!(all(windows, target_env = "msvc")) {
-            match get_sdk() {
-                Ok(mut v) => v.pop().unwrap(),
-                Err(_) => PathBuf::new(),
-            }
+            get_sdk().unwrap_or_default()
         } else if cfg!(windows) {
             PathBuf::from("\\")
         } else {
@@ -736,14 +736,13 @@ impl WindowsResource {
             PathBuf::from("llvm-rc")
         } else {
             let rc_exe = PathBuf::from(&self.toolkit_path).join("rc.exe");
-            if !rc_exe.exists() {
-                if cfg!(target_arch = "x86_64") {
-                    PathBuf::from(&self.toolkit_path).join(r"bin\x64\rc.exe")
-                } else {
-                    PathBuf::from(&self.toolkit_path).join(r"bin\x86\rc.exe")
-                }
-            } else {
+            if rc_exe.exists() {
                 rc_exe
+            } else {
+                let bin = PathBuf::from(&self.toolkit_path).join("bin");
+                find_rc_arch_dir(&bin)
+                    .unwrap_or_else(|| bin.join(RC_ARCH_DIRS[0]))
+                    .join("rc.exe")
             }
         };
 
@@ -790,65 +789,115 @@ impl WindowsResource {
     }
 }
 
-/// Find a Windows SDK
-fn get_sdk() -> io::Result<Vec<PathBuf>> {
-    let output = process::Command::new("reg")
-        .arg("query")
-        .arg(r"HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots")
-        .arg("/reg:32")
-        .output()?;
+/// Subdirectories of an SDK `bin` directory that hold `rc.exe`, most preferred first.
+///
+/// A build script is compiled for the host, so `target_arch` picks the host tools. ARM64 hosts
+/// can run the x64 and x86 tools under emulation.
+const RC_ARCH_DIRS: &[&str] = if cfg!(target_arch = "aarch64") {
+    &["arm64", "x64", "x86"]
+} else if cfg!(target_arch = "x86_64") {
+    &["x64", "x86"]
+} else {
+    &["x86"]
+};
 
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "Querying the registry failed with error message:\n{}",
-            String::from_utf8(output.stderr).map_err(|e| io::Error::other(e.to_string()))?
-        )));
+/// Parse an SDK version directory name such as `10.0.26100.0` into a sortable key
+fn version_key(name: &str) -> Option<[u32; 4]> {
+    let mut parts = [0_u32; 4];
+    let mut fields = name.split('.');
+    for part in &mut parts {
+        *part = fields.next()?.parse().ok()?;
     }
+    fields.next().is_none().then_some(parts)
+}
 
-    let lines = String::from_utf8(output.stdout).map_err(|e| io::Error::other(e.to_string()))?;
-    let mut kits: Vec<PathBuf> = Vec::new();
-    let mut lines: Vec<&str> = lines.lines().collect();
-    lines.reverse();
-    for line in lines {
-        if line.trim().starts_with("KitsRoot") {
-            let kit: String = line
-                .chars()
-                .skip(line.find("REG_SZ").unwrap() + 6)
-                .skip_while(|c| c.is_whitespace())
-                .collect();
+/// Find the directory holding `rc.exe` for the most preferred host architecture
+fn find_rc_arch_dir(bin: &Path) -> Option<PathBuf> {
+    RC_ARCH_DIRS
+        .iter()
+        .map(|arch| bin.join(arch))
+        .find(|dir| dir.join("rc.exe").exists())
+}
 
-            let p = PathBuf::from(&kit);
-            let rc = if cfg!(target_arch = "x86_64") {
-                p.join(r"bin\x64\rc.exe")
-            } else {
-                p.join(r"bin\x86\rc.exe")
-            };
+/// Find the directory holding `rc.exe` of the newest kit installed under `root`
+fn find_rc_dir(root: &Path) -> Option<PathBuf> {
+    let bin = root.join("bin");
 
-            if rc.exists() {
-                println!("{:?}", rc);
-                kits.push(rc.parent().unwrap().to_owned());
+    let mut versions: Vec<([u32; 4], OsString)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&bin) {
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
             }
-
-            if let Ok(bin) = p.join("bin").read_dir() {
-                for e in bin.filter_map(|e| e.ok()) {
-                    let p = if cfg!(target_arch = "x86_64") {
-                        e.path().join(r"x64\rc.exe")
-                    } else {
-                        e.path().join(r"x86\rc.exe")
-                    };
-                    if p.exists() {
-                        println!("{:?}", p);
-                        kits.push(p.parent().unwrap().to_owned());
-                    }
-                }
+            let name = entry.file_name();
+            if let Some(key) = name.to_str().and_then(version_key) {
+                versions.push((key, name));
             }
         }
     }
-    if kits.is_empty() {
-        return Err(io::Error::other("Can not find Windows SDK"));
+    versions.sort_unstable_by_key(|(key, _)| Reverse(*key));
+
+    // Newest versioned tool directory first, then the flat layout of kits older than 10.
+    let mut candidates: Vec<PathBuf> = versions.iter().map(|(_, name)| bin.join(name)).collect();
+    candidates.push(bin);
+    candidates.iter().find_map(|dir| find_rc_arch_dir(dir))
+}
+
+/// Registry key listing the roots of every installed Windows Kit
+const INSTALLED_ROOTS_KEY: &str = r"HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots";
+
+/// Values of [`INSTALLED_ROOTS_KEY`] naming a kit root, newest kit first
+///
+/// `KitsRoot10` covers the Windows 10 and Windows 11 SDKs alike; the others are 8.1 and 8.0.
+const KIT_ROOT_VALUES: &[&str] = &["KitsRoot10", "KitsRoot81", "KitsRoot"];
+
+/// Read one kit root from the registry, if that kit is installed
+///
+/// The kit roots are stored in the 32-bit view of the registry.
+fn query_kit_root(value: &str) -> io::Result<Option<PathBuf>> {
+    let output = process::Command::new("reg")
+        .args(["query", INSTALLED_ROOTS_KEY, "/v", value, "/reg:32"])
+        .output()?;
+
+    if !output.status.success() {
+        return Ok(None);
     }
 
-    Ok(kits)
+    // `reg` writes the console code page, which is not necessarily UTF-8.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.lines().find_map(|line| {
+        let (name, root) = line.split_once("REG_SZ")?;
+        (name.trim() == value).then(|| PathBuf::from(root.trim()))
+    }))
+}
+
+/// Find a Windows SDK
+fn get_sdk() -> io::Result<PathBuf> {
+    // `RC_PATH` and a Developer Command Prompt both name the resource compiler outright, so the
+    // registry does not have to be queried at all.
+    if let Some(rc_exe) = env::var_os("RC_PATH") {
+        let dir = Path::new(&rc_exe).parent();
+        if let Some(dir) = dir.filter(|dir| !dir.as_os_str().is_empty()) {
+            return Ok(dir.to_owned());
+        }
+    }
+    if let Some(bin) = env::var_os("WindowsSdkVerBinPath") {
+        if let Some(dir) = find_rc_arch_dir(Path::new(&bin)) {
+            return Ok(dir);
+        }
+    }
+
+    // Asking for each root by name keeps `reg` from formatting the hundreds of unrelated values
+    // stored under the same key, which costs several times more than the query itself.
+    for value in KIT_ROOT_VALUES {
+        if let Some(root) = query_kit_root(value)? {
+            if let Some(dir) = find_rc_dir(&root) {
+                return Ok(dir);
+            }
+        }
+    }
+
+    Err(io::Error::other("Can not find Windows SDK"))
 }
 
 #[cfg(feature = "toml")]
